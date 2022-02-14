@@ -1,13 +1,11 @@
 import ipaddress
 import random
 from os import environ
-from typing import Union
 
-import requests
 from asyncpg import UniqueViolationError
 from fastapi import FastAPI, Body
+from httpx import TimeoutException
 from icecream import ic
-from requests import ReadTimeout
 from starlette.background import BackgroundTasks
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -60,7 +58,7 @@ def ip_is_local(ip: str) -> bool:
     return False
 
 
-def propagate(path: str, args: dict, ignore=None):
+async def propagate(path: str, args: dict, ignore=None):
     global self_url
     nodes = NodesManager.get_nodes()
     print(args)
@@ -76,13 +74,13 @@ def propagate(path: str, args: dict, ignore=None):
             continue
         try:
             if path == 'push_block':
-                r = requests.post(f'{node_url}/{path}', json=args, timeout=20, headers={'Sender-Node': self_url})
+                r = await NodesManager.request(f'{node_url}/{path}', method='POST', json=args, headers={'Sender-Node': self_url})
             else:
-                r = requests.get(f'{node_url}/{path}', args, timeout=5, headers={'Sender-Node': self_url})
-            print('node response: ', r.json())
+                r = await NodesManager.request(f'{node_url}/{path}', params=args, headers={'Sender-Node': self_url})
+            print('node response: ', r)
         except Exception as e:
             print(e)
-            if not isinstance(e, ReadTimeout):
+            if not isinstance(e, TimeoutException):
                 NodesManager.get_nodes().remove(_node_url)
             NodesManager.sync()
 
@@ -95,21 +93,20 @@ async def create_blocks(blocks: list):
     for block_info in blocks:
         block = block_info['block']
         txs_hex = block_info['transactions']
-        txs = merkle_tree_txs = [await Transaction.from_hex(tx) for tx in txs_hex]
+        txs = [await Transaction.from_hex(tx) for tx in txs_hex]
         for tx in txs:
             if isinstance(tx, CoinbaseTransaction):
                 txs.remove(tx)
                 break
-        merkle_tree_txs = [tx.hex() for tx in merkle_tree_txs]
-        block['merkle_tree'] = get_transactions_merkle_tree(txs) if i > 22500 else get_transactions_merkle_tree_ordered(
-            txs)
+        hex_txs = [tx.hex() for tx in txs]
+        block['merkle_tree'] = get_transactions_merkle_tree(hex_txs) if i > 22500 else get_transactions_merkle_tree_ordered(hex_txs)
         block_content = block_to_bytes(last_block['hash'], block)
 
-        if i <= 22500:
+        if i <= 22500 and sha256(block_content) != block['hash'] and i != 17972:
             from itertools import permutations
-            for l in permutations(merkle_tree_txs):
-                txs = list(l)
-                block['merkle_tree'] = get_transactions_merkle_tree_ordered(txs)
+            for l in permutations(hex_txs):
+                _hex_txs = list(l)
+                block['merkle_tree'] = get_transactions_merkle_tree_ordered(_hex_txs)
                 block_content = block_to_bytes(last_block['hash'], block)
                 if sha256(block_content) == block['hash']:
                     break
@@ -132,9 +129,9 @@ async def _sync_blockchain(node_url: str = None):
     _, last_block = await calculate_difficulty()
     i = await db.get_next_block_id()
     node_interface = NodeInterface(node_url)
-    if last_block != {}:
+    local_cache = None
+    if last_block != {} and last_block['id'] > 500:
         remote_last_block = node_interface.get_block(i-1)['block']
-        local_cache = None
         if remote_last_block['hash'] != last_block['hash']:
             print(remote_last_block['hash'])
             offset, limit = i - 500, 500
@@ -222,7 +219,7 @@ async def middleware(request: Request, call_next):
         try:
             node_url = nodes[0]
             #requests.get(f'{node_url}/add_node', {'url': })
-            r = requests.get(f'{node_url}/get_nodes')
+            r = NodesManager.client.get(f'{node_url}/get_nodes')
             j = r.json()
             nodes.extend(j['result'])
             NodesManager.sync()
@@ -245,7 +242,7 @@ async def middleware(request: Request, call_next):
             NodesManager.sync()
 
             try:
-                propagate('add_node', {'url': self_url})
+                await propagate('add_node', {'url': self_url})
             except:
                 pass
     try:
@@ -355,13 +352,13 @@ async def get_mining_info(background_tasks: BackgroundTasks):
 
 
 @app.get("/get_address_info")
-async def get_address_info(address: str):
+async def get_address_info(address: str, transactions_count_limit: int = 5):
     outputs = await db.get_spendable_outputs(address)
     balance = sum(output.amount for output in outputs)
     return {'ok': True, 'result': {
         'balance': balance,
-        'spendable_outputs': [{'amount': output.amount, 'tx_hash': output.tx_hash, 'index': output.index} for output in
-                              outputs]
+        'spendable_outputs': [{'amount': output.amount, 'tx_hash': output.tx_hash, 'index': output.index} for output in outputs],
+        'transactions': [await transaction_to_json(tx) for tx in await db.get_address_transactions(address, limit=transactions_count_limit)]
     }}
 
 
@@ -375,7 +372,7 @@ async def add_node(url: str, background_tasks: BackgroundTasks):
         return {'ok': False, 'error': 'Node already present'}
     else:
         try:
-            assert NodesManager.is_node_working(url)
+            assert await NodesManager.is_node_working(url)
             background_tasks.add_task(propagate, 'add_node', {'url': url}, url)
             NodesManager.add_node(url)
             return {'ok': True, 'result': 'Node added'}

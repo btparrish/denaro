@@ -270,6 +270,16 @@ class Database:
                         outputs.remove((tx_input.tx_hash, tx_input.index))
             return outputs
 
+    async def get_address_transactions(self, address: str, check_pending_txs: bool = False, check_signatures: bool = False, limit: int = 50) -> List[Union[Transaction, CoinbaseTransaction]]:
+        point = string_to_point(address)
+        search = ['%' + point_to_bytes(string_to_point(address), address_format).hex() + '%' for address_format in list(AddressFormat)]
+        addresses = [point_to_string(point, address_format) for address_format in list(AddressFormat)]
+        async with self.pool.acquire() as connection:
+            txs = await connection.fetch('SELECT tx_hex, blocks.id AS block_no FROM transactions INNER JOIN blocks ON (transactions.block_hash = blocks.hash) WHERE tx_hex LIKE ANY($1) OR $2 && inputs_addresses ORDER BY block_no DESC LIMIT $3', search, addresses, limit)
+            if check_pending_txs:
+                txs = await connection.fetch("SELECT tx_hex FROM pending_transactions WHERE tx_hex LIKE ANY($1) OR $1 && inputs_addresses", addresses) + txs
+        return [await Transaction.from_hex(tx['tx_hex'], check_signatures) for tx in txs]
+
     async def get_spendable_outputs(self, address: str, check_pending_txs: bool = False) -> List[TransactionInput]:
         point = string_to_point(address)
         search = ['%'+point_to_bytes(string_to_point(address), address_format).hex()+'%' for address_format in list(AddressFormat)]
@@ -284,9 +294,7 @@ class Database:
             tx = await Transaction.from_hex(tx['tx_hex'], check_signatures=False)
             for i, tx_output in enumerate(tx.outputs):
                 if tx_output.address in addresses:
-                    tx_input = TransactionInput(tx_hash, i)
-                    tx_input.amount = tx_output.amount
-                    tx_input.transaction = tx
+                    tx_input = TransactionInput(tx_hash, i, transaction=tx, amount=tx_output.amount)
                     outputs.append((tx_hash, i))
                     inputs.append(tx_input)
         for spender_tx in spender_txs:
