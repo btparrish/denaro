@@ -1,4 +1,3 @@
-import ipaddress
 import random
 from os import environ
 
@@ -11,9 +10,10 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from denaro.helpers import timestamp, sha256, transaction_to_json
-from denaro.manager import create_block, get_difficulty, Manager, get_transactions_merkle_tree, check_block_is_valid, \
+from denaro.manager import create_block, get_difficulty, Manager, get_transactions_merkle_tree, \
     split_block_content, calculate_difficulty, clear_pending_transactions, block_to_bytes, get_transactions_merkle_tree_ordered
 from denaro.node.nodes_manager import NodesManager, NodeInterface
+from denaro.node.utils import ip_is_local
 from denaro.transactions import Transaction, CoinbaseTransaction
 from denaro import Database
 from denaro.constants import VERSION, ENDIAN
@@ -28,60 +28,24 @@ self_url = None
 print = ic
 
 
-def ip_is_local(ip: str) -> bool:
-    try:
-        addr = ipaddress.ip_address(ip)
-    except:
-        return False
-    networks = [
-        '10.0.0.0/8',
-        '172.16.0.0/12',
-        '192.168.0.0/16',
-        '0.0.0.0/8',
-        '100.64.0.0/10',
-        '127.0.0.0/8',
-        '169.254.0.0/16',
-        '192.0.0.0/24',
-        '192.0.2.0/24',
-        '192.88.99.0/24',
-        '198.18.0.0/15',
-        '198.51.100.0/24',
-        '203.0.113.0/24',
-        '224.0.0.0/4',
-        '233.252.0.0/24',
-        '240.0.0.0/4',
-        '255.255.255.255/32'
-    ]
-    for network in networks:
-        if addr in ipaddress.ip_network(network):
-            return True
-    return False
-
-
-async def propagate(path: str, args: dict, ignore=None):
+async def propagate(path: str, args: dict, ignore_url=None):
     global self_url
+    self_node = NodeInterface(self_url or '')
+    ignore_node = NodeInterface(ignore_url or '')
     nodes = NodesManager.get_nodes()
     print(args)
-    for node_url in random.choices(nodes, k=5) if len(nodes) > 5 else nodes:
-        _node_url = node_url
-        node_url = node_url.strip('/')
-        node_base_url = node_url.replace('http://', '', 1).replace('https://', '', 1)
-        if (
-            self_url and node_base_url == self_url.replace('http://', '', 1).replace('https://', '', 1)
-        ) or (
-            ignore and node_base_url == ignore.replace('http://', '', 1).replace('https://', '', 1)
-        ):
+    for node_url in random.choices(nodes, k=50) if len(nodes) > 50 else nodes:
+        node_interface = NodeInterface(node_url)
+        print('sending to', node_url)
+        if node_interface.base_url == self_node.base_url or node_interface.base_url == ignore_node.base_url:
             continue
         try:
-            if path == 'push_block':
-                r = await NodesManager.request(f'{node_url}/{path}', method='POST', json=args, headers={'Sender-Node': self_url})
-            else:
-                r = await NodesManager.request(f'{node_url}/{path}', params=args, headers={'Sender-Node': self_url})
+            r = await node_interface.request(path, args, self_node.url)
             print('node response: ', r)
         except Exception as e:
             print(e)
             if not isinstance(e, TimeoutException):
-                NodesManager.get_nodes().remove(_node_url)
+                NodesManager.get_nodes().remove(node_url)
             NodesManager.sync()
 
 
@@ -131,11 +95,11 @@ async def _sync_blockchain(node_url: str = None):
     node_interface = NodeInterface(node_url)
     local_cache = None
     if last_block != {} and last_block['id'] > 500:
-        remote_last_block = node_interface.get_block(i-1)['block']
+        remote_last_block = (await node_interface.get_block(i-1))['block']
         if remote_last_block['hash'] != last_block['hash']:
             print(remote_last_block['hash'])
             offset, limit = i - 500, 500
-            remote_blocks = node_interface.get_blocks(i-500, 500)
+            remote_blocks = await node_interface.get_blocks(i-500, 500)
             local_blocks = await db.get_blocks(offset, limit)
             local_blocks.reverse()
             remote_blocks.reverse()
@@ -163,7 +127,7 @@ async def _sync_blockchain(node_url: str = None):
     while True:
         i = await db.get_next_block_id()
         try:
-            blocks = node_interface.get_blocks(i, limit)
+            blocks = await node_interface.get_blocks(i, limit)
         except Exception as e:
             print(e)
             #NodesManager.get_nodes().remove(node_url)
@@ -219,8 +183,7 @@ async def middleware(request: Request, call_next):
         try:
             node_url = nodes[0]
             #requests.get(f'{node_url}/add_node', {'url': })
-            r = NodesManager.client.get(f'{node_url}/get_nodes')
-            j = r.json()
+            j = await NodesManager.request(f'{node_url}/get_nodes')
             nodes.extend(j['result'])
             NodesManager.sync()
         except:
@@ -263,7 +226,10 @@ async def exception_handler(request: Request, e: Exception):
 
 
 @app.get("/push_tx")
-async def push_tx(tx_hex: str, background_tasks: BackgroundTasks):
+@app.post("/push_tx")
+async def push_tx(background_tasks: BackgroundTasks, tx_hex: str = None, body=Body(False)):
+    if body and tx_hex is None:
+        tx_hex = body['tx_hex']
     tx = await Transaction.from_hex(tx_hex)
     try:
         if await db.add_pending_transaction(tx):
@@ -358,7 +324,7 @@ async def get_address_info(address: str, transactions_count_limit: int = 5):
     return {'ok': True, 'result': {
         'balance': balance,
         'spendable_outputs': [{'amount': output.amount, 'tx_hash': output.tx_hash, 'index': output.index} for output in outputs],
-        'transactions': [await transaction_to_json(tx) for tx in await db.get_address_transactions(address, limit=transactions_count_limit)]
+        'transactions': [await transaction_to_json(tx) for tx in await db.get_address_transactions(address, limit=transactions_count_limit, check_signatures=True)]
     }}
 
 
